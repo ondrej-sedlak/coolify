@@ -1521,6 +1521,44 @@ class Application extends BaseModel
         return false;
     }
 
+    /**
+     * Whether GitHub release events trigger a deployment instead of pushes.
+     */
+    public function isReleaseDeployable(): bool
+    {
+        return (bool) ($this->settings->is_release_deploy_enabled ?? false);
+    }
+
+    /**
+     * Whether GitHub webhooks can reach this application: through a GitHub App source, or through a
+     * manually configured repository webhook on a repository that lives on a GitHub host.
+     */
+    public function usesGithubWebhooks(): bool
+    {
+        if ($this->isGithubAppSource()) {
+            return true;
+        }
+        if (filled($this->source_id)) {
+            return false;
+        }
+        $repository = (string) $this->git_repository;
+        if ($repository === '') {
+            return false;
+        }
+        if (str_contains($repository, '://')) {
+            $host = parse_url($repository, PHP_URL_HOST);
+        } else {
+            $host = parseScpStyleGitUrl($repository)['host'] ?? null;
+        }
+        if (is_string($host) && $host !== '') {
+            $host = strtolower(trim($host, '[]'));
+
+            return $host === 'github.com' || str_ends_with($host, '.ghe.com');
+        }
+        // An "owner/repo" shorthand without a host means github.com.
+        return preg_match('/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/', $repository) === 1;
+    }
+
     public function deploymentType()
     {
         $privateKeyId = data_get($this, 'private_key_id');

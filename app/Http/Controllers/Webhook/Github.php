@@ -36,6 +36,12 @@ class Github extends Controller
     use MatchesManualWebhookApplications;
     use ReadsWebhookPushPayload;
 
+    /**
+     * Release event actions that publish a full release and trigger a release deployment.
+     * Drafts and prereleases never deploy.
+     */
+    private const RELEASE_DEPLOY_ACTIONS = ['published', 'released'];
+
     public function manual(Request $request)
     {
         try {
@@ -76,10 +82,19 @@ class Github extends Controller
                 ] = $this->readPullRequestPayload($payload);
                 $full_name = data_get($payload, 'repository.full_name');
             }
-            if (! in_array($x_github_event, ['push', 'pull_request'])) {
+            if ($x_github_event === 'release') {
+                [
+                    'action' => $action,
+                    'tag_name' => $tag_name,
+                    'is_prerelease' => $is_prerelease,
+                    'is_draft' => $is_draft,
+                ] = $this->readReleasePayload($payload);
+                $full_name = data_get($payload, 'repository.full_name');
+            }
+            if (! in_array($x_github_event, ['push', 'pull_request', 'release'])) {
                 return response("Nothing to do. Event '$x_github_event' is not supported.");
             }
-            if (! $branch || ($x_github_event === 'pull_request' && $action !== 'closed' && ! $base_branch)) {
+            if ($x_github_event !== 'release' && (! $branch || ($x_github_event === 'pull_request' && $action !== 'closed' && ! $base_branch))) {
                 return response('Nothing to do. No branch found in the request.');
             }
             // A deleted branch has no commit to deploy. No secret is checked here.
@@ -92,6 +107,7 @@ class Github extends Controller
             }
             $matched_branch = match (true) {
                 $x_github_event === 'push' => $branch,
+                $x_github_event === 'release' => null,
                 $action === 'closed' => null,
                 default => $base_branch,
             };
@@ -99,8 +115,11 @@ class Github extends Controller
             // A redelivery of the same signed payload is one guess.
             $failure_attempt = $this->manualWebhookSignedPayloadAttempt($request, $x_hub_signature_256);
             $applications = Application::query();
-            if ($x_github_event === 'push' || $action !== 'closed') {
+            if ($x_github_event === 'push' || ($x_github_event === 'pull_request' && $action !== 'closed')) {
                 $applications->where('git_branch', $matched_branch);
+            }
+            if ($x_github_event === 'release') {
+                $applications->whereHas('settings', fn ($query) => $query->where('is_release_deploy_enabled', true));
             }
             $applications = $this->manualWebhookApplications($applications, $full_name);
             if ($applications->isEmpty()) {
@@ -148,6 +167,17 @@ class Github extends Controller
                         continue;
                     }
                     if ($x_github_event === 'push') {
+                        if ($application->isReleaseDeployable()) {
+                            $return_payloads->push([
+                                'application' => $application->name,
+                                'status' => 'skipped',
+                                'message' => 'Deploy on release is enabled for this application. Ignoring push.',
+                                'application_uuid' => $application->uuid,
+                                'application_name' => $application->name,
+                            ]);
+
+                            continue;
+                        }
                         if ($application->isDeployable()) {
                             if ($this->webhookPushMatchesWatchPaths($application, $changed_files)) {
                                 if ($skip_deploy_commits ?? false) {
@@ -249,6 +279,21 @@ class Github extends Controller
                             'status' => 'queued',
                             'message' => 'PR webhook received, processing queued.',
                         ]);
+                    }
+                    if ($x_github_event === 'release') {
+                        $release_payload = $this->handleReleaseEvent(
+                            application: $application,
+                            action: $action ?? null,
+                            tagName: $tag_name ?? null,
+                            isPrerelease: $is_prerelease ?? false,
+                            isDraft: $is_draft ?? false,
+                            mode: 'manual',
+                            fullName: $full_name,
+                        );
+                        if ($release_payload['status'] === 'queue_full') {
+                            return response($release_payload['message'], 429)->header('Retry-After', 60);
+                        }
+                        $return_payloads->push($release_payload);
                     }
                 }
             }
@@ -470,10 +515,23 @@ class Github extends Controller
                     return response('Nothing to do. Invalid repository.');
                 }
             }
-            if (! in_array($x_github_event, ['push', 'pull_request'])) {
+            if ($x_github_event === 'release') {
+                $id = $this->webhookPayloadDatabaseId($payload, 'repository.id');
+                [
+                    'action' => $action,
+                    'tag_name' => $tag_name,
+                    'is_prerelease' => $is_prerelease,
+                    'is_draft' => $is_draft,
+                ] = $this->readReleasePayload($payload);
+                $full_name = $this->manualWebhookRepositoryFullName(data_get($payload, 'repository.full_name'));
+                if ($full_name === null) {
+                    return response('Nothing to do. Invalid repository.');
+                }
+            }
+            if (! in_array($x_github_event, ['push', 'pull_request', 'release'])) {
                 return response("Nothing to do. Event '$x_github_event' is not supported.");
             }
-            if (! $id || ! $branch || ($x_github_event === 'pull_request' && $action !== 'closed' && ! $base_branch)) {
+            if (! $id || ($x_github_event !== 'release' && ! $branch) || ($x_github_event === 'pull_request' && $action !== 'closed' && ! $base_branch)) {
                 return response('Nothing to do. No id or branch found.');
             }
             if ($x_github_event === 'push' && $this->isWebhookBranchDeletionPush($payload)) {
@@ -501,6 +559,14 @@ class Github extends Controller
                     return response("Nothing to do. No applications found with branch '$base_branch'.");
                 }
             }
+            if ($x_github_event === 'release') {
+                $applications = $applications
+                    ->whereHas('settings', fn ($query) => $query->where('is_release_deploy_enabled', true))
+                    ->get();
+                if ($applications->isEmpty()) {
+                    return response('Nothing to do. No applications found with release deployments enabled.');
+                }
+            }
             $applicationsByServer = $applications->groupBy(function ($app) {
                 return $app->destination->server_id;
             });
@@ -519,6 +585,16 @@ class Github extends Controller
                         continue;
                     }
                     if ($x_github_event === 'push') {
+                        if ($application->isReleaseDeployable()) {
+                            $return_payloads->push([
+                                'status' => 'skipped',
+                                'message' => 'Deploy on release is enabled for this application. Ignoring push.',
+                                'application_uuid' => $application->uuid,
+                                'application_name' => $application->name,
+                            ]);
+
+                            continue;
+                        }
                         if ($application->isDeployable()) {
                             if ($this->webhookPushMatchesWatchPaths($application, $changed_files)) {
                                 if ($skip_deploy_commits ?? false) {
@@ -615,6 +691,22 @@ class Github extends Controller
                             'message' => 'PR webhook received, processing queued.',
                         ]);
                     }
+                    if ($x_github_event === 'release') {
+                        $release_payload = $this->handleReleaseEvent(
+                            application: $application,
+                            action: $action ?? null,
+                            tagName: $tag_name ?? null,
+                            isPrerelease: $is_prerelease ?? false,
+                            isDraft: $is_draft ?? false,
+                            mode: 'app',
+                            fullName: $full_name,
+                            githubAppId: $github_app->id,
+                        );
+                        if ($release_payload['status'] === 'queue_full') {
+                            return response($release_payload['message'], 429)->header('Retry-After', 60);
+                        }
+                        $return_payloads->push($release_payload);
+                    }
                 }
             }
 
@@ -678,6 +770,78 @@ class Github extends Controller
             'commit_sha' => $head_sha ?? 'HEAD',
             'is_fork_pull_request' => $this->isForkPullRequest($payload),
         ];
+    }
+
+    /**
+     * Read and validate the release payload fields that the handler uses.
+     *
+     * @return array{action: string, tag_name: ?string, is_prerelease: bool, is_draft: bool}
+     *
+     * @throws InvalidWebhookPayloadException When the action is missing or not a string.
+     */
+    private function readReleasePayload(mixed $payload): array
+    {
+        return [
+            'action' => $this->webhookPayloadString($payload, 'action', required: true) ?? '',
+            'tag_name' => $this->webhookPayloadString($payload, 'release.tag_name'),
+            'is_prerelease' => data_get($payload, 'release.prerelease') === true,
+            'is_draft' => data_get($payload, 'release.draft') === true,
+        ];
+    }
+
+    /**
+     * Handle a GitHub release event for one application: queue a deployment of the release tag
+     * when the release is a published full release and the application deploys on releases.
+     *
+     * @return array{status: string, message: string, application: string, application_uuid: string, application_name: string, deployment_uuid?: string|null}
+     */
+    private function handleReleaseEvent(Application $application, ?string $action, ?string $tagName, bool $isPrerelease, bool $isDraft, string $mode, ?string $fullName, ?int $githubAppId = null): array
+    {
+        $payload = [
+            'application' => $application->name,
+            'application_uuid' => $application->uuid,
+            'application_name' => $application->name,
+        ];
+        if (! in_array($action, self::RELEASE_DEPLOY_ACTIONS, true) || $isPrerelease || $isDraft) {
+            return [...$payload, 'status' => 'skipped', 'message' => "Nothing to do. Release action '".($action ?? '')."' is not a published full release."];
+        }
+        if (! $application->isDeployable()) {
+            return [...$payload, 'status' => 'failed', 'message' => 'Deployments disabled.'];
+        }
+        if (blank($tagName)) {
+            return [...$payload, 'status' => 'skipped', 'message' => 'Nothing to do. The release has no tag name.'];
+        }
+        try {
+            $commit = validateGitRef($tagName, 'release tag');
+        } catch (Exception) {
+            return [...$payload, 'status' => 'skipped', 'message' => 'Nothing to do. The release tag is not a valid git ref.'];
+        }
+        $deployment_uuid = new_public_id();
+        $result = queue_application_deployment(
+            application: $application,
+            deployment_uuid: $deployment_uuid,
+            commit: $commit,
+            force_rebuild: false,
+            is_webhook: true,
+        );
+        if ($result['status'] === 'queue_full') {
+            return [...$payload, 'status' => 'queue_full', 'message' => $result['message']];
+        }
+        if ($result['status'] !== 'skipped' && ! empty($result['deployment_uuid'])) {
+            auditLog('webhook.deployment.queued', array_filter([
+                'provider' => 'github',
+                'mode' => $mode,
+                'application_uuid' => $application->uuid,
+                'application_name' => $application->name,
+                'deployment_uuid' => $result['deployment_uuid'],
+                'commit' => $commit,
+                'repository' => $fullName,
+                'github_app_id' => $githubAppId,
+                'release' => $tagName,
+            ]));
+        }
+
+        return [...$payload, 'status' => $result['status'], 'message' => $result['message'], 'deployment_uuid' => $result['deployment_uuid'] ?? null];
     }
 
     /**

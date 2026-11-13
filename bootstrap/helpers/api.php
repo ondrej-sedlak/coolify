@@ -240,6 +240,7 @@ function sharedDataApplications(?Application $application = null): array
         'is_static' => 'boolean',
         'is_spa' => 'boolean',
         'is_auto_deploy_enabled' => 'boolean',
+        'is_release_deploy_enabled' => 'boolean',
         'is_force_https_enabled' => 'boolean',
         'is_preview_deployments_enabled' => 'boolean',
         'use_build_secrets' => 'boolean',
@@ -526,6 +527,7 @@ function removeUnnecessaryFieldsFromRequest(Request $request)
     $request->offsetUnset('is_static');
     $request->offsetUnset('is_spa');
     $request->offsetUnset('is_auto_deploy_enabled');
+    $request->offsetUnset('is_release_deploy_enabled');
     $request->offsetUnset('is_force_https_enabled');
     $request->offsetUnset('is_preview_deployments_enabled');
     $request->offsetUnset('connect_to_docker_network');

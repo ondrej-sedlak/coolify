@@ -49,6 +49,14 @@
                                 ['value' => true, 'label' => 'Deploy on push (webhooks)'],
                                 ['value' => false, 'label' => 'Manual deployments only'],
                             ]" :disabled="! $canUpdate" />
+                        @if ($application->usesGithubWebhooks())
+                            <x-forms.listbox id="isReleaseDeployEnabled" label="Deploy on release" onChange="instantSave"
+                                helper="GitHub only: deploy only when a new release is published on GitHub, and ignore pushes. The release tag is deployed. For a manual repository webhook, enable the Releases event on the webhook in GitHub."
+                                :options="[
+                                    ['value' => false, 'label' => 'Deploy on push (webhooks)'],
+                                    ['value' => true, 'label' => 'Deploy only on new release'],
+                                ]" :disabled="! $canUpdate" />
+                        @endif
                         <x-forms.listbox id="isAutoCancelQueuedDeploymentsEnabled" label="Queued webhook deployments"
                             onChange="instantSave"
                             helper="When a newer push arrives, cancel the older webhook deployments that still wait in the queue, so only the latest commit is built. Manual, API, restart, and rollback deployments are never cancelled."

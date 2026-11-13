@@ -7,7 +7,9 @@
                     'url' => $githubManualWebhook,
                     'key' => 'github',
                     'secret' => 'githubManualWebhookSecret',
-                    'description' => 'Accepts JSON or form-urlencoded webhook payloads.',
+                    'description' => $resource instanceof \App\Models\Application && $resource->isReleaseDeployable()
+                        ? 'Accepts JSON or form-urlencoded webhook payloads. This application deploys on releases only, so enable the Releases event on this webhook in GitHub.'
+                        : 'Accepts JSON or form-urlencoded webhook payloads.',
                 ],
                 [
                     'name' => 'GitLab',
